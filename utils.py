@@ -11,7 +11,7 @@ from sklearn.metrics import confusion_matrix
 from torch.utils.data import DataLoader
 
 from model import *
-from datasets import MNIST_truncated, CIFAR10_truncated, SVHN_custom, FashionMNIST_truncated, CustomTensorDataset, CelebA_custom, FEMNIST, Generated, genData
+from datasets import MNIST_truncated, CIFAR10_truncated, SVHN_custom, FashionMNIST_truncated, CustomTensorDataset, CelebA_custom, FEMNIST, Generated, SplitCIFAR10, genData, get_non_iid_50_v1
 from math import sqrt
 
 import torch.nn as nn
@@ -492,8 +492,8 @@ class AddGaussianNoise(object):
     def __repr__(self):
         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
-def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_level=0, net_id=None, total=0):
-    if dataset in ('mnist', 'femnist', 'fmnist', 'cifar10', 'svhn', 'generated', 'covtype', 'a9a', 'rcv1', 'SUSY'):
+def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_level=0, net_id=None, total=0, num_clients=None):
+    if dataset in ('mnist', 'femnist', 'fmnist', 'cifar10', 'svhn', 'generated', 'covtype', 'a9a', 'rcv1', 'SUSY', 'split_cifar10', 'non_iid_50_v1'):
         if dataset == 'mnist':
             dl_obj = MNIST_truncated
 
@@ -551,7 +551,12 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             transform_test = transforms.Compose([
                 transforms.ToTensor(),
                 AddGaussianNoise(0., noise_level, net_id, total)])
-
+        elif dataset == "split_cifar10":
+            trains, tests, train_sizes = SplitCIFAR10(num_clients, train_bs)
+            return trains, tests, None, None, train_sizes
+        elif dataset == "non_iid_50_v1":
+            trains, tests, train_sizes = get_non_iid_50_v1(train_bs, num_workers=2, num_clients=num_clients)
+            return trains, tests, None, None, train_sizes
         else:
             dl_obj = Generated
             transform_train = None

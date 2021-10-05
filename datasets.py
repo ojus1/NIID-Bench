@@ -15,6 +15,9 @@ import os
 import os.path
 import logging
 import torchvision.datasets.utils as utils
+from torchvision import transforms
+import random
+from sklearn.model_selection import train_test_split
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -717,3 +720,321 @@ class genData(MNIST):
         return data, target
     def __len__(self):
         return len(self.data)
+
+def split_dataset_disjoint_labels(num_clients, dataset, num_groups=2):
+    assert(num_clients % num_groups == 0)
+    
+    labels = [y for x, y in dataset]
+    labels_to_idx = {}
+    for i, l in enumerate(labels):
+        if l not in labels_to_idx:
+            labels_to_idx[l] = []
+        labels_to_idx[l].append(i)
+
+    num_classes = len(set(labels))
+    assert(num_classes % num_groups == 0)
+
+    labels_to_chunks = {}
+    chunk_counter = {}
+    for k, v in labels_to_idx.items():
+        labels_to_chunks[k] = np.split(np.array(v), num_clients // num_groups)
+        chunk_counter[k] = 0
+
+    group_ids = []
+    for gid in range(num_groups):
+        group_ids += [gid] * (num_clients // num_groups)
+    random.shuffle(group_ids)
+
+    unique_labels = list(range(num_classes))
+    group_id_to_labels = {}
+    random.shuffle(unique_labels)
+    for i, l in enumerate(unique_labels):
+        if i % num_groups not in group_id_to_labels:
+            group_id_to_labels[i % num_groups] = []
+        group_id_to_labels[i % num_groups].append(l)
+
+    client_id_to_idx = {}
+    for c in range(num_clients):
+        for l in unique_labels:
+            if l in group_id_to_labels[group_ids[c]]:
+                if client_id_to_idx.get(c, False) == False:
+                    client_id_to_idx[c] = [] 
+                client_id_to_idx[c].extend(list(labels_to_chunks[l][chunk_counter[l]])) 
+                chunk_counter[l] += 1
+    return client_id_to_idx
+
+def classwise_subset(total_dataset, num_clients, num_groups, test_split=0.1):
+    client_id_to_idx = split_dataset_disjoint_labels(num_clients, total_dataset, num_groups)
+    train, test = {}, {}
+    train_sizes = torch.zeros((num_clients,))
+
+    for c, indices in client_id_to_idx.items():
+        train_idx, test_idx = train_test_split(indices, test_size=test_split)
+        train[c] = train_idx
+        test[c] = test_idx 
+
+        train_sizes[c] = len(train_idx)
+    return train, test, train_sizes
+
+def SplitCIFAR10(num_clients, batch_size):
+    print(num_clients)
+    transform = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(32, 4),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+    transform_val = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+
+    trainset = CIFAR10(
+        root="./data", train=True, download=True, transform=transform
+    )
+    testset = CIFAR10(
+        root="./data", train=False, download=True, transform=transform_val
+    )
+    # Make Overlapping non-IID client splits
+    total = torch.utils.data.ConcatDataset([trainset, testset])
+    train_idx, test_idx, train_sizes = classwise_subset(
+        total,
+        num_clients,
+        5,
+        0.1
+    )
+    cifar_test_loader_list = []
+    cifar_train_loader_list = []
+    for c in range(num_clients):
+        # ts = torch.utils.data.Subset(total, train_idx[c])
+        train_dl = torch.utils.data.DataLoader(
+            total, 
+            batch_size=batch_size, 
+            pin_memory=False, 
+            sampler=torch.utils.data.SubsetRandomSampler(train_idx[c])
+        )
+        cifar_train_loader_list.append(train_dl)
+
+        test_dl = torch.utils.data.DataLoader(
+            total, batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=False,
+            sampler=torch.utils.data.SubsetRandomSampler(test_idx[c])
+        )
+        cifar_test_loader_list.append(test_dl)
+    return cifar_train_loader_list, cifar_test_loader_list, train_sizes
+
+non_iid_50_home = "/home/surya/Documents/Projects/distributed-ml-research/split_nn_ucb/non_iid_50/scripts/tasks/"
+
+from functools import partial
+from operator import sub
+import os
+import pdb
+import glob
+import numpy as np
+from misc.utils import *
+from dataclasses import dataclass
+import torch
+import math
+
+
+@dataclass
+class Arguments:
+    base_dir: str
+    num_clients: int
+
+
+class DataLoader:
+    """ Data Loader
+
+    Loading data for the corresponding clients
+
+    Created by:
+        Wonyong Jeong (wyjeong@kaist.ac.kr)
+
+    Modified by: 
+        Surya Kant Sahu (surya.oju@pm.me)
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.base_dir = args.base_dir
+        self.did_to_dname = {
+            0: 'cifar10',
+            1: 'cifar100',
+            2: 'mnist',
+            3: 'svhn',
+            4: 'fashion_mnist',
+            5: 'traffic_sign',
+            6: 'face_scrub',
+            7: 'not_mnist',
+        }
+
+        files = os.listdir(self.args.base_dir)
+        files = ["_".join(f.replace(".npy", "").split("_")[:-1])
+                 for f in files]
+        files = ['cifar100_0', 'cifar10_0', 'fashion_mnist_0', 'mnist_0', 'not_mnist_0', 'svhn_0', 'face_scrub_0', 'traffic_sign_0', 'cifar100_1', 'cifar10_1', 'fashion_mnist_1', 'mnist_1', 'not_mnist_1', 'svhn_1', 'face_scrub_1', 'traffic_sign_1']
+        assert(self.args.num_clients <= len(files))
+        self.task_set = {
+            k: [v] for k, v in enumerate(files[:self.args.num_clients])
+        }
+
+    def get_train(self, cid, task_id):
+        return load_task(self.base_dir, self.task_set[cid][task_id]+'_train.npy').item()
+
+    def get_valid(self, cid, task_id):
+        valid = load_task(
+            self.base_dir, self.task_set[cid][task_id]+'_valid.npy').item()
+        return valid['x_valid'], valid['y_valid']
+
+    def get_test(self, cid, task_id):
+        x_test_list = []
+        y_test_list = []
+        for tid, task in enumerate(self.task_set[cid]):
+            if tid <= task_id:
+                test = load_task(self.base_dir, task+'_test.npy').item()
+                x_test_list.append(test['x_test'])
+                y_test_list.append(test['y_test'])
+        return x_test_list, y_test_list
+
+
+class ShuffledCycle:
+    def __init__(self, indices):
+        self.indices = indices
+        self.i = 0
+        random_shuffle(77, self.indices)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.i >= len(self.indices):
+            self.i = 0
+            random_shuffle(77, self.indices)
+        self.i += 1
+        return self.indices[self.i-1]
+
+
+class NonIID50Train(torch.utils.data.Dataset):
+    def __init__(self, num_clients, client_id, version):
+        assert(version in ['v1', 'v2'])
+
+        self.num_clients = num_clients
+        self.client_id = client_id
+
+        args = Arguments(f"./non_iid_50/scripts/tasks/non_iid_50_{version}/non_iid_50/", num_clients)
+        self.dl = dl = DataLoader(args)
+        self.data = {}
+        for k in range(num_clients):
+            x, y = dl.get_train(k, 0)
+            self.data[k] = {
+                "x": x[0],
+                "y": y[0]
+            }
+
+        self.ds_sizes = {k: v["x"].shape[0] for k, v in self.data.items()}
+        self.index_cycles = {k: ShuffledCycle(
+            list(range(v))) for k, v in self.ds_sizes.items()}
+
+    def __len__(self):
+        return self.ds_sizes[self.client_id]
+
+    def __getitem__(self, *args):
+        c = self.client_id
+        idx = next(self.index_cycles[c])
+        xc = self.data[c]["x"][idx].transpose(2, 0, 1)
+        yc = one_hot_to_int(self.data[c]["y"][idx])
+
+        return xc, yc
+
+    def shuffle(self):
+        pass
+
+
+class NonIID50Test(torch.utils.data.Dataset):
+    def __init__(self, num_clients, client_id, version):
+        assert(version in ['v1', 'v2'])
+
+        self.num_clients = num_clients
+        self.client_id = client_id
+
+        args = Arguments(f"./non_iid_50/scripts/tasks/non_iid_50_{version}/non_iid_50/", num_clients)
+        self.dl = dl = DataLoader(args)
+        self.data = {}
+        for k in range(num_clients):
+            x, y = dl.get_test(k, 0)
+            self.data[k] = {
+                "x": x[0],
+                "y": y[0]
+            }
+
+        self.ds_sizes = {k: v["x"].shape[0] for k, v in self.data.items()}
+        self.index_cycles = {k: ShuffledCycle(
+            list(range(v))) for k, v in self.ds_sizes.items()}
+
+    def __len__(self):
+        return self.ds_sizes[self.client_id]
+
+    def __getitem__(self, *args):
+        c = self.client_id
+        idx = next(self.index_cycles[c])
+        xc = self.data[c]["x"][idx].transpose(2, 0, 1)
+        yc = one_hot_to_int(self.data[c]["y"][idx])
+
+        return xc, yc
+
+    def shuffle(self):
+        pass
+
+
+def one_hot_to_int(onehot):
+    for i in range(len(onehot)):
+        if onehot[i] > 0.:
+            return i
+
+def non_iid_50_collate_fn(batches):
+    xb, yb = [], []
+    for x, y in batches:
+        xb.append(x)
+        yb.append(y)
+    xb = torch.FloatTensor(np.stack(xb)).contiguous()
+    yb = torch.LongTensor(np.stack(yb)).contiguous()
+    return xb, yb
+
+def get_non_iid_50_v1(batch_size, num_workers, num_clients):
+    tr_dl = []
+    for i in range(num_clients):
+        tr_ds = NonIID50Train(num_clients, i, batch_size, version="v1")
+        dataset_sizes = [int(i) for i in tr_ds.ds_sizes]
+        dl = torch.utils.data.DataLoader(
+            tr_ds, batch_size, num_workers=num_workers, collate_fn=non_iid_50_collate_fn, pin_memory=True)
+        tr_dl.append(dl)
+
+    ts_dl = []
+    for i in range(num_clients):
+        ts_ds = NonIID50Test(num_clients, client_id=i, version="v1")
+        dl = torch.utils.data.DataLoader(
+            ts_ds, batch_size, num_workers=num_workers, collate_fn=non_iid_50_collate_fn, pin_memory=True)
+        ts_dl.append(dl)
+    return tr_dl, ts_dl, dataset_sizes
+
+def get_non_iid_50_v2(batch_size, num_workers, num_clients):
+    tr_dl = []
+    for i in range(num_clients):
+        tr_ds = NonIID50Train(num_clients, i, batch_size, version="v2")
+        dataset_sizes = [int(i) for i in tr_ds.ds_sizes]
+        dl = torch.utils.data.DataLoader(
+            tr_ds, batch_size, num_workers=num_workers, collate_fn=non_iid_50_collate_fn, pin_memory=True)
+        tr_dl.append(dl)
+
+    ts_dl = []
+    for i in range(num_clients):
+        ts_ds = NonIID50Test(num_clients, client_id=i, version="v2")
+        dl = torch.utils.data.DataLoader(
+            ts_ds, batch_size, num_workers=num_workers, collate_fn=non_iid_50_collate_fn, pin_memory=True)
+        ts_dl.append(dl)
+    return tr_dl, ts_dl, dataset_sizes

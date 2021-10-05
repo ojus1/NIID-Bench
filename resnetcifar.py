@@ -332,7 +332,7 @@ def ResNet18_cifar10(**kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return ResNetCifar10(BasicBlock, [2, 2, 2, 2], **kwargs)
+    return ResNetCifar10(BasicBlock, [2, 2, 2], **kwargs)
 
 
 
@@ -345,3 +345,45 @@ def ResNet50_cifar10(**kwargs):
         progress (bool): If True, displays a progress bar of the download to stderr
     """
     return ResNetCifar10(Bottleneck, [3, 4, 6, 3], **kwargs)
+
+import torch.nn as nn
+import torch.nn.functional as F
+import functools
+import operator
+
+class Conv2dSamePadding(nn.Conv2d):
+    def __init__(self,*args,**kwargs):
+        super(Conv2dSamePadding, self).__init__(*args, **kwargs)
+        self.zero_pad_2d = nn.ZeroPad2d(functools.reduce(operator.__add__,
+                  [(k // 2 + (k - 2 * (k // 2)) - 1, k // 2) for k in self.kernel_size[::-1]]))
+
+    def forward(self, input):
+        return  self._conv_forward(self.zero_pad_2d(input), self.weight, self.bias)
+
+class LeNet(nn.Module):
+    def __init__(self, num_classes):
+        super(LeNet, self).__init__()
+        self.conv1 = nn.Sequential(
+            Conv2dSamePadding(3, 20, 5, stride=1),
+            nn.ReLU(inplace=True),
+            nn.LocalResponseNorm(size=4, alpha=0.001/9.0, beta=0.75, k=1.0),
+            nn.MaxPool2d((3, 3), (2, 2), padding=1)
+        )
+        self.conv2 = nn.Sequential(
+            Conv2dSamePadding(20, 50, 5, stride=1),
+            nn.ReLU(inplace=True),
+            nn.LocalResponseNorm(size=4, alpha=0.001/9.0, beta=0.75, k=1.0),
+            nn.MaxPool2d(3, 2, padding=1)
+        )
+        self.fc1   = nn.Linear(3200, 800)
+        self.fc2   = nn.Linear(800, 500)
+        self.fc3   = nn.Linear(500, num_classes)
+
+    def forward(self, x):
+        layer1_out = self.conv1(x)
+        out = self.conv2(layer1_out)
+        out = out.view(out.shape[0], -1)
+        out = F.relu(self.fc1(out))
+        out = F.relu(self.fc2(out))
+        out = self.fc3(out)
+        return out
