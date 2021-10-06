@@ -926,16 +926,16 @@ class NonIID50Train(torch.utils.data.Dataset):
         self.num_clients = num_clients
         self.client_id = client_id
 
-        args = Arguments(f"./non_iid_50/scripts/tasks/non_iid_50_{version}/non_iid_50/", num_clients)
+        args = Arguments(os.path.join(non_iid_50_home, f"non_iid_50_{version}/non_iid_50/"), num_clients)
         self.dl = dl = DataLoader(args)
         self.data = {}
         for k in range(num_clients):
-            x, y = dl.get_train(k, 0)
+            d = dl.get_train(k, 0)
             self.data[k] = {
-                "x": x[0],
-                "y": y[0]
+                "x": d['x_train'],
+                "y": d['y_train']
             }
-
+            
         self.ds_sizes = {k: v["x"].shape[0] for k, v in self.data.items()}
         self.index_cycles = {k: ShuffledCycle(
             list(range(v))) for k, v in self.ds_sizes.items()}
@@ -962,7 +962,7 @@ class NonIID50Test(torch.utils.data.Dataset):
         self.num_clients = num_clients
         self.client_id = client_id
 
-        args = Arguments(f"./non_iid_50/scripts/tasks/non_iid_50_{version}/non_iid_50/", num_clients)
+        args = Arguments(os.path.join(non_iid_50_home, f"non_iid_50_{version}/non_iid_50/"), num_clients)
         self.dl = dl = DataLoader(args)
         self.data = {}
         for k in range(num_clients):
@@ -1008,7 +1008,7 @@ def non_iid_50_collate_fn(batches):
 def get_non_iid_50_v1(batch_size, num_workers, num_clients):
     tr_dl = []
     for i in range(num_clients):
-        tr_ds = NonIID50Train(num_clients, i, batch_size, version="v1")
+        tr_ds = NonIID50Train(num_clients, i, version="v1")
         dataset_sizes = [int(i) for i in tr_ds.ds_sizes]
         dl = torch.utils.data.DataLoader(
             tr_ds, batch_size, num_workers=num_workers, collate_fn=non_iid_50_collate_fn, pin_memory=True)

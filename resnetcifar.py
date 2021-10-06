@@ -332,7 +332,7 @@ def ResNet18_cifar10(**kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return ResNetCifar10(BasicBlock, [2, 2, 2], **kwargs)
+    return ResNetCifar10(BasicBlock, [2, 2, 2, 2], **kwargs)
 
 
 

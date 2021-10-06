@@ -1,8 +1,10 @@
+from typing import final
 import numpy as np
 import json
 import torch
 import torch.optim as optim
 import torch.nn as nn
+from torch.utils.data import dataset
 import torchvision
 import torchvision.transforms as transforms
 from torch.autograd import Variable
@@ -31,11 +33,11 @@ def get_args():
     parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
-    parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=5,  help='number of workers in a distributed cluster')
+    parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
+    parser.add_argument('--n_parties', type=int, default=1,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
                             help='communication strategy: fedavg/fedprox')
-    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
+    parser.add_argument('--comm_round', type=int, default=20, help='number of maximum communication roun')
     parser.add_argument('--is_same_initial', type=int, default=1, help='Whether initial all the models with the same parameters in fedavg')
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
@@ -52,6 +54,7 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--suffix', type=int, help='random number to suffix the name of the run')
     args = parser.parse_args()
     return args
 
@@ -103,7 +106,12 @@ def init_nets(net_configs, dropout_p, n_parties, args):
             elif args.dataset == 'celeba':
                 net = ModerateCNN(output_dim=2)
         elif args.model == "resnet":
-            net = ResNet50_cifar10()
+            if args.dataset == "non_iid_50_v1":
+                net = ResNet18_cifar10(num_classes=5)
+            elif args.dataset == "split_cifar10":
+                net = ResNet18_cifar10(num_classes=10)
+            else:
+                net = ResNet50_cifar10()
         elif args.model == "vgg16":
             net = vgg16()
         else:
@@ -432,6 +440,9 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
 def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataloader, epochs, lr, args_optimizer, device="cpu"):
     print('Training network %s' % str(net_id))
 
+    to_server = 0
+    to_client = 0
+    flops = 0
     train_acc = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
@@ -463,6 +474,7 @@ def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataload
                 target = target.long()
 
                 out = net(x)
+                flops += compute_flops(net, (x, ), "client")
                 loss = criterion(out, target)
 
                 loss.backward()
@@ -482,6 +494,8 @@ def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataload
     net_para = net.state_dict()
     norm_grad = copy.deepcopy(global_model.state_dict())
     for key in norm_grad:
+        to_server += compute_comm_cost(net_para[key])
+        to_client += compute_comm_cost(net_para[key])
         #norm_grad[key] = (global_model_para[key] - net_para[key]) / a_i
         norm_grad[key] = torch.true_divide(global_model_para[key]-net_para[key], a_i)
     train_acc = compute_accuracy(net, train_dataloader, device=device)
@@ -492,7 +506,7 @@ def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataload
 
 
     print(' ** Training complete **')
-    return train_acc, test_acc, a_i, norm_grad
+    return train_acc, test_acc, a_i, norm_grad, flops, to_server + to_client
 
 
 def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, net_dataidx_map = None, test_dl = None, device="cpu"):
@@ -520,8 +534,7 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
         noise_level = args.noise
         if net_id == args.n_parties - 1:
             noise_level = 0
-        
-        if args.dataset in ['split_cifar10', "non_iid_50_id"]:
+        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
             train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
             print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
@@ -558,41 +571,47 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
 
     avg_acc /= len(selected)
     # if args.alg == 'local_training':
-    print(f"avg test acc {avg_acc}, flops {flops * 1e-12}, to_server {to_server * 1e-3}, to_client {to_client * 1e-3}")
+    print(f"avg test acc {avg_acc}, flops {total_flops * 1e-12}, to_server {to_server * 1e-3}, to_client {to_client * 1e-3}")
 
     nets_list = list(nets.values())
-    return dataset_sizes
+    return {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": to_client * 1e-3 + to_server * 1e-3}, dataset_sizes
 
-def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu"):
+    total_comm_cost = 0
+    total_flops = 0
     avg_acc = 0.0
 
     a_list = []
     d_list = []
     n_list = []
     global_model.to(device)
+    train_dls_local, test_dls_local, _, _, dataset_sizes = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, num_clients=5)
     for net_id, net in nets.items():
         if net_id not in selected:
             continue
-        dataidxs = net_dataidx_map[net_id]
 
-        print("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         # move the model to cuda device:
         net.to(device)
 
         noise_level = args.noise
         if net_id == args.n_parties - 1:
             noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+            train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
+            print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            if args.noise_type == 'space':
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+            train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
 
-        trainacc, testacc, a_i, d_i = train_net_fednova(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, device=device)
+        trainacc, testacc, a_i, d_i, flops, comm_cost = train_net_fednova(net_id, net, global_model, train_dl_local, test_dl_local, n_epoch, args.lr, args.optimizer, device=device)
+        total_flops += flops
+        total_comm_cost += comm_cost
 
         a_list.append(a_i)
         d_list.append(d_i)
@@ -603,11 +622,11 @@ def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map,
 
 
     avg_acc /= len(selected)
-    if args.alg == 'local_training':
-        print("avg test acc %f" % avg_acc)
+    print(f"avg test acc {avg_acc}, flops {total_flops * 1e-12}, comm_cost {comm_cost * 1e-3}")
 
     nets_list = list(nets.values())
-    return nets_list, a_list, d_list, n_list
+    stats = {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": total_comm_cost * 1e-3}
+    return nets_list, a_list, d_list, n_list, stats, dataset_sizes
 
 def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./data', logdir='./logs', beta=0.5):
     seed = init_seed
@@ -647,6 +666,8 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     print(device)
+
+    final_stats = []
 
     seed = args.init_seed
     print("#" * 100)
@@ -776,8 +797,9 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            dataset_sizes = local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, device=device)
+            stats, dataset_sizes = local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, device=device)
             # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+            final_stats.append(stats)
 
             # update global model
             total_data_points = sum([dataset_sizes[r] for r in selected])
@@ -808,12 +830,12 @@ if __name__ == '__main__':
         for key in d_total_round:
             d_total_round[key] = 0
 
-        data_sum = 0
-        for i in range(args.n_parties):
-            data_sum += len(traindata_cls_counts[i])
-        portion = []
-        for i in range(args.n_parties):
-            portion.append(len(traindata_cls_counts[i]) / data_sum)
+        # data_sum = 0
+        # for i in range(args.n_parties):
+        #     data_sum += len(traindata_cls_counts[i])
+        # portion = []
+        # for i in range(args.n_parties):
+        #     portion.append(len(traindata_cls_counts[i]) / data_sum)
 
         global_para = global_model.state_dict()
         if args.is_same_initial:
@@ -836,7 +858,14 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            _, a_list, d_list, n_list = local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            _, a_list, d_list, n_list, stats, dataset_sizes = local_train_net_fednova(nets, selected, global_model, args, device=device)
+            final_stats.append(stats)
+
+            data_sum = sum(dataset_sizes)
+            portion = []
+            for i in range(args.n_parties):
+                portion.append(dataset_sizes[i] / data_sum)
+
             total_n = sum(n_list)
             #print("total_n:", total_n)
             d_total_round = copy.deepcopy(global_model.state_dict())
@@ -876,17 +905,6 @@ if __name__ == '__main__':
             global_model.load_state_dict(updated_model)
 
 
-            print('global n_training: %d' % len(train_dl_global))
-            print('global n_test: %d' % len(test_dl_global))
-
-            global_model.to('cpu')
-            train_acc = compute_accuracy(global_model, train_dl_global)
-            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True)
-
-
-            print('>> Global Model Train accuracy: %f' % train_acc)
-            print('>> Global Model Test accuracy: %f' % test_acc)
-
     elif args.alg == 'local_training':
         print("Initializing nets")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
@@ -901,4 +919,8 @@ if __name__ == '__main__':
 
         print("All in test acc: %f" % testacc)
 
-   
+    import json
+
+    to_save = {"args": args.__repr__(), "stats": flatten(final_stats)}
+    name = f"{args.dataset}_{args.alg}_{args.n_parties}_{args.suffix}"
+    json.dump(to_save, open(f"./stats/{name}.json", "w"))
