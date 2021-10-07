@@ -129,6 +129,7 @@ def init_nets(net_configs, dropout_p, n_parties, args):
 
 
 def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, device="cpu"):
+    flops = 0
     print('Training network %s' % str(net_id))
 
     train_acc = compute_accuracy(net, train_dataloader, device=device)
@@ -166,6 +167,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
                 target = target.long()
 
                 out = net(x)
+                flops += compute_flops(net, (x,), "client")
                 loss = criterion(out, target)
 
                 loss.backward()
@@ -199,11 +201,90 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
 
     print(' ** Training complete **')
-    return train_acc, test_acc
+    return train_acc, test_acc, flops
 
 
+def train_net_fedavg(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, device="cpu"):
+    flops = 0
+    comm = 0
+    print('Training network %s' % str(net_id))
+    print('n_training: %d' % len(train_dataloader))
+    print('n_test: %d' % len(test_dataloader))
+
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+    print('>> Pre-Training Training accuracy: {}'.format(train_acc))
+    print('>> Pre-Training Test accuracy: {}'.format(test_acc))
+
+
+    if args_optimizer == 'adam':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
+    elif args_optimizer == 'amsgrad':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
+                               amsgrad=True)
+    elif args_optimizer == 'sgd':
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=args.rho, weight_decay=args.reg)
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    cnt = 0
+    mu = 0.
+    global_weight_collector = list(global_net.to(device).parameters())
+
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for batch_idx, (x, target) in enumerate(train_dataloader):
+            x, target = x.to(device), target.to(device)
+
+            optimizer.zero_grad()
+            x.requires_grad = True
+            target.requires_grad = False
+            target = target.long()
+
+            out = net(x)
+            flops += compute_flops(net, (x, ), "client")
+            loss = criterion(out, target)
+
+            #for fedprox
+            fed_prox_reg = 0.0
+            for param_index, param in enumerate(net.parameters()):
+                fed_prox_reg += ((mu / 2) * torch.norm((param - global_weight_collector[param_index]))**2)
+            loss += fed_prox_reg
+
+
+            loss.backward()
+            optimizer.step()
+
+            cnt += 1
+            epoch_loss_collector.append(loss.item())
+
+        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+        print('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+
+        # if epoch % 10 == 0:
+        #     train_acc = compute_accuracy(net, train_dataloader, device=device)
+        #     test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+        #
+        #     print('>> Training accuracy: %f' % train_acc)
+        #     print('>> Test accuracy: %f' % test_acc)
+
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+    print('>> Training accuracy: %f' % train_acc)
+    print('>> Test accuracy: %f' % test_acc)
+
+
+    print(' ** Training complete **')
+    for param in net.parameters():
+        comm += compute_comm_cost(param) * 2
+
+    return train_acc, test_acc, flops, comm
 
 def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, device="cpu"):
+    flops = 0
+    comm = 0
     print('Training network %s' % str(net_id))
     print('n_training: %d' % len(train_dataloader))
     print('n_test: %d' % len(test_dataloader))
@@ -240,6 +321,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
             target = target.long()
 
             out = net(x)
+            flops += compute_flops(net, (x, ), "client")
             loss = criterion(out, target)
 
             #for fedprox
@@ -273,7 +355,10 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
 
 
     print(' ** Training complete **')
-    return train_acc, test_acc
+    for param in net.parameters():
+        comm += compute_comm_cost(param) * 2
+
+    return train_acc, test_acc, flops, comm
 
 def view_image(train_dataloader):
     for (x, target) in train_dataloader:
@@ -282,15 +367,17 @@ def view_image(train_dataloader):
         exit(0)
 
 
-def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, device="cpu"):
+
+def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu"):
+    total_flops = 0
+    total_comm = 0
     avg_acc = 0.0
+
+    train_dls_local, test_dls_local, _, _, dataset_sizes = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, num_clients=5)
 
     for net_id, net in nets.items():
         if net_id not in selected:
             continue
-        dataidxs = net_dataidx_map[net_id]
-
-        print("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         # move the model to cuda device:
         net.to(device)
 
@@ -298,39 +385,40 @@ def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, devic
         if net_id == args.n_parties - 1:
             noise_level = 0
 
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+            train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
+            print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            if args.noise_type == 'space':
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+            train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
-
-        trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, device=device)
+        trainacc, testacc, flops, comm = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl_local, n_epoch, args.lr, args.optimizer, args.mu, device=device)
+        total_flops += flops
+        total_comm += comm
         print("net %d final test acc %f" % (net_id, testacc))
         avg_acc += testacc
-        # saving the trained models here
-        # save_model(net, net_id, args)
-        # else:
-        #     load_model(net, net_id, device=device)
+
     avg_acc /= len(selected)
-    if args.alg == 'local_training':
-        print("avg test acc %f" % avg_acc)
+    print(f"avg test acc {avg_acc}, flops {total_flops * 1e-12}, comm_cost {total_comm * 1e-3}")
 
     nets_list = list(nets.values())
-    return nets_list
+    return {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": total_comm * 1e-3}, dataset_sizes
 
-
-def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net_fedavg(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu"):
+    total_flops = 0
+    total_comm = 0
     avg_acc = 0.0
+
+    train_dls_local, test_dls_local, _, _, dataset_sizes = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, num_clients=5)
 
     for net_id, net in nets.items():
         if net_id not in selected:
             continue
-        dataidxs = net_dataidx_map[net_id]
-
-        print("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         # move the model to cuda device:
         net.to(device)
 
@@ -338,24 +426,29 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map,
         if net_id == args.n_parties - 1:
             noise_level = 0
 
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+            train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
+            print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            if args.noise_type == 'space':
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+            train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
-        trainacc, testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args.mu, device=device)
+        trainacc, testacc, flops, comm = train_net_fedavg(net_id, net, global_model, train_dl_local, test_dl_local, n_epoch, args.lr, args.optimizer, args.mu, device=device)
+        total_flops += flops
+        total_comm += comm
         print("net %d final test acc %f" % (net_id, testacc))
         avg_acc += testacc
+
     avg_acc /= len(selected)
-    if args.alg == 'local_training':
-        print("avg test acc %f" % avg_acc)
+    print(f"avg test acc {avg_acc}, flops {total_flops * 1e-12}, comm_cost {total_comm * 1e-3}")
 
     nets_list = list(nets.values())
-    return nets_list
-
+    return {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": total_comm * 1e-3}, dataset_sizes
 
 def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_dataloader, test_dataloader, epochs, lr, args_optimizer, device="cpu"):
     print('Training network %s' % str(net_id))
@@ -682,6 +775,7 @@ if __name__ == '__main__':
         global_model = global_models[0]
 
         global_para = global_model.state_dict()
+
         if args.is_same_initial:
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
@@ -702,8 +796,23 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
-            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+            stats, dataset_sizes = local_train_net_fedavg(nets, selected, global_model, args, device=device)
+            final_stats.append(stats)
+            global_model.to('cpu')
+
+            # update global model
+            total_data_points = sum([dataset_sizes[r] for r in selected])
+            fed_avg_freqs = [dataset_sizes[r] / total_data_points for r in selected]
+
+            for idx in range(len(selected)):
+                net_para = nets[selected[idx]].cpu().state_dict()
+                if idx == 0:
+                    for key in net_para:
+                        global_para[key] = net_para[key] * fed_avg_freqs[idx]
+                else:
+                    for key in net_para:
+                        global_para[key] += net_para[key] * fed_avg_freqs[idx]
+            global_model.load_state_dict(global_para)
 
     elif args.alg == 'fedprox':
         print("Initializing nets")
@@ -733,12 +842,13 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            stats, dataset_sizes = local_train_net_fedprox(nets, selected, global_model, args, device=device)
+            final_stats.append(stats)
             global_model.to('cpu')
 
             # update global model
-            total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+            total_data_points = sum([dataset_sizes[r] for r in selected])
+            fed_avg_freqs = [dataset_sizes[r] / total_data_points for r in selected]
 
             for idx in range(len(selected)):
                 net_para = nets[selected[idx]].cpu().state_dict()
@@ -750,17 +860,6 @@ if __name__ == '__main__':
                         global_para[key] += net_para[key] * fed_avg_freqs[idx]
             global_model.load_state_dict(global_para)
 
-
-            print('global n_training: %d' % len(train_dl_global))
-            print('global n_test: %d' % len(test_dl_global))
-
-
-            train_acc = compute_accuracy(global_model, train_dl_global)
-            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True)
-
-
-            print('>> Global Model Train accuracy: %f' % train_acc)
-            print('>> Global Model Test accuracy: %f' % test_acc)
 
     elif args.alg == 'scaffold':
         print("Initializing nets")
