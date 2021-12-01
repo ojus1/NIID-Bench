@@ -28,11 +28,11 @@ from flops_comm import *
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='MLP', help='neural network used in training')
-    parser.add_argument('--dataset', type=str, choices=["non_iid_50_v1", "split_cifar10"], help='dataset used for training')
+    parser.add_argument('--dataset', type=str, choices=["non_iid_50_v1", "split_cifar10", "domainnet"], help='dataset used for training')
     parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', '))))
     parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
-    parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
-    parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
+    parser.add_argument('--batch-size', type=int, default=100, help='input batch size for training (default: 64)')
+    parser.add_argument('--lr', type=float, default=0.001/3, help='learning rate (default: 0.01)')
     parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=1,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
@@ -48,7 +48,7 @@ def get_args():
     parser.add_argument('--beta', type=float, default=0.5, help='The parameter for the dirichlet distribution for data partitioning')
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
-    parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
+    parser.add_argument('--optimizer', type=str, default='adam', help='the optimizer')
     parser.add_argument('--mu', type=float, default=1, help='the mu parameter for fedprox')
     parser.add_argument('--noise', type=float, default=0, help='how much noise we add to some party')
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
@@ -110,6 +110,8 @@ def init_nets(net_configs, dropout_p, n_parties, args):
                 net = ResNet18_cifar10(num_classes=5)
             elif args.dataset == "split_cifar10":
                 net = ResNet18_cifar10(num_classes=10)
+            elif args.dataset == "domainnet":
+                net = ResNet18_cifar10(num_classes=345)
             else:
                 net = ResNet50_cifar10()
         elif args.model == "vgg16":
@@ -282,7 +284,7 @@ def train_net_fedavg(net_id, net, global_net, train_dataloader, test_dataloader,
 
     return train_acc, test_acc, flops, comm
 
-def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, device="cpu"):
+def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, device="cpu", count=0):
     flops = 0
     comm = 0
     print('Training network %s' % str(net_id))
@@ -307,7 +309,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
     criterion = nn.CrossEntropyLoss().to(device)
 
     cnt = 0
-    # mu = 0.001
+    mu = 0.01
     global_weight_collector = list(global_net.to(device).parameters())
 
     for epoch in range(epochs):
@@ -324,6 +326,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
             flops += compute_flops(net, (x, ), "client")
             loss = criterion(out, target)
 
+            count += 1
             #for fedprox
             fed_prox_reg = 0.0
             for param_index, param in enumerate(net.parameters()):
@@ -358,7 +361,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
     for param in net.parameters():
         comm += compute_comm_cost(param) * 2
 
-    return train_acc, test_acc, flops, comm
+    return train_acc, test_acc, flops, comm, count
 
 def view_image(train_dataloader):
     for (x, target) in train_dataloader:
@@ -368,7 +371,7 @@ def view_image(train_dataloader):
 
 
 
-def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu"):
+def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu", count=0):
     total_flops = 0
     total_comm = 0
     avg_acc = 0.0
@@ -385,7 +388,7 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=
         if net_id == args.n_parties - 1:
             noise_level = 0
 
-        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+        if args.dataset in ['split_cifar10', "non_iid_50_v1", "domainnet"]:
             train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
             print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
@@ -397,7 +400,7 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=
             train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
-        trainacc, testacc, flops, comm = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl_local, n_epoch, args.lr, args.optimizer, args.mu, device=device)
+        trainacc, testacc, flops, comm, count = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl_local, n_epoch, args.lr, args.optimizer, args.mu, device=device, count=count)
         total_flops += flops
         total_comm += comm
         print("net %d final test acc %f" % (net_id, testacc))
@@ -407,7 +410,7 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map=
     print(f"avg test acc {avg_acc}, flops {total_flops * 1e-12}, comm_cost {total_comm * 1e-3}")
 
     nets_list = list(nets.values())
-    return {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": total_comm * 1e-3}, dataset_sizes
+    return {"acc": avg_acc, "cflops": total_flops * 1e-12, "comm_cost": total_comm * 1e-3}, dataset_sizes, count
 
 def local_train_net_fedavg(nets, selected, global_model, args, net_dataidx_map=None, test_dl = None, device="cpu"):
     total_flops = 0
@@ -426,7 +429,7 @@ def local_train_net_fedavg(nets, selected, global_model, args, net_dataidx_map=N
         if net_id == args.n_parties - 1:
             noise_level = 0
 
-        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+        if args.dataset in ['split_cifar10', "non_iid_50_v1", "domainnet"]:
             train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
             print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
@@ -627,7 +630,7 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
         noise_level = args.noise
         if net_id == args.n_parties - 1:
             noise_level = 0
-        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+        if args.dataset in ['split_cifar10', "non_iid_50_v1", "domainnet"]:
             train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
             print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
@@ -689,7 +692,7 @@ def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map=
         noise_level = args.noise
         if net_id == args.n_parties - 1:
             noise_level = 0
-        if args.dataset in ['split_cifar10', "non_iid_50_v1"]:
+        if args.dataset in ['split_cifar10', "non_iid_50_v1", "domainnet"]:
             train_dl_local, test_dl_local = train_dls_local[net_id], test_dls_local[net_id]
             print("Training network %s. n_training: %d" % (str(net_id), dataset_sizes[net_id]))
         else:
@@ -825,7 +828,7 @@ if __name__ == '__main__':
         if args.is_same_initial:
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
-
+        count = 0
         for round in range(args.comm_round):
             print("in comm round:" + str(round))
 
@@ -842,7 +845,7 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            stats, dataset_sizes = local_train_net_fedprox(nets, selected, global_model, args, device=device)
+            stats, dataset_sizes, count = local_train_net_fedprox(nets, selected, global_model, args, device=device, count=count)
             final_stats.append(stats)
             global_model.to('cpu')
 
@@ -859,7 +862,7 @@ if __name__ == '__main__':
                     for key in net_para:
                         global_para[key] += net_para[key] * fed_avg_freqs[idx]
             global_model.load_state_dict(global_para)
-
+        print("ENDED. Training iterations:", count)
 
     elif args.alg == 'scaffold':
         print("Initializing nets")

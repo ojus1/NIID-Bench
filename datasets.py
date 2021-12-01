@@ -18,6 +18,7 @@ import torchvision.datasets.utils as utils
 from torchvision import transforms
 import random
 from sklearn.model_selection import train_test_split
+from domainnet import get_domainnet
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -777,7 +778,6 @@ def classwise_subset(total_dataset, num_clients, num_groups, test_split=0.1):
     return train, test, train_sizes
 
 def SplitCIFAR10(num_clients, batch_size):
-    print(num_clients)
     transform = transforms.Compose(
         [
             transforms.RandomHorizontalFlip(),

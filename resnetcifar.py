@@ -387,3 +387,12 @@ class LeNet(nn.Module):
         out = F.relu(self.fc2(out))
         out = self.fc3(out)
         return out
+
+if __name__ == "__main__":
+    # net = ResNet18_cifar10(num_classes=345)
+    # img = torch.randn(32, 3, 64, 64)
+    # out = net(img)
+    # print(out.shape)
+    model = LeNet(10).cuda()
+    from torchsummary import summary
+    summary(model, (3, 32, 32))
